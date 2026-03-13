@@ -1,0 +1,1131 @@
+#!/usr/bin/env node
+// ============================================================================
+// twitter-bookmarks.mjs — 提取 X (Twitter) 书签内容（含视频下载）
+//
+// 用法:
+//   node twitter-bookmarks.mjs                    # 默认提取 10 个书签
+//   node twitter-bookmarks.mjs --count 20         # 提取 20 个书签
+//   node twitter-bookmarks.mjs --output ~/bookmarks.json  # 输出到文件
+//   node twitter-bookmarks.mjs --obsidian         # 保存到 Obsidian（含下载的视频）
+//   node twitter-bookmarks.mjs --download-videos   # 下载视频到本地
+// ============================================================================
+
+import puppeteer from "puppeteer-core";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, createWriteStream } from "fs";
+import path from "path";
+import { execSync, spawn } from "child_process";
+import https from "https";
+import http from "http";
+
+// ---- 解析参数 ----
+function parseArgs() {
+    const args = process.argv.slice(2);
+    const config = {
+        port: null,
+        count: 10,
+        output: null,
+        obsidian: false,
+        // 默认使用用户的 Obsidian vault
+        obsidianPath: path.join(process.env.HOME || '/Users/lv', 'Documents/Obsidian Vault/Inbox/X Bookmarks'),
+        scrollDelay: 2000,
+        downloadVideos: true,  // 默认下载视频
+        // 视频也保存到 vault 内，方便直接在 Obsidian 中播放
+        videoDir: path.join(process.env.HOME || '/Users/lv', 'Documents/Obsidian Vault/Inbox/X Bookmarks/videos'),
+        videoSizeThreshold: 500 * 1024 * 1024,  // 500MB - 超过此大小跳过下载
+        videoTimeout: 600000,  // 10分钟超时
+    };
+
+    for (let i = 0; i < args.length; i++) {
+        switch (args[i]) {
+            case "--port":
+            case "-p":
+                config.port = parseInt(args[++i], 10);
+                break;
+            case "--count":
+            case "-c":
+                config.count = parseInt(args[++i], 10);
+                break;
+            case "--output":
+            case "-o":
+                config.output = args[++i];
+                break;
+            case "--obsidian":
+                config.obsidian = true;
+                break;
+            case "--obsidian-path":
+                config.obsidianPath = args[++i];
+                break;
+            case "--no-video-download":
+                config.downloadVideos = false;
+                break;
+            case "--video-dir":
+                config.videoDir = args[++i];
+                break;
+            case "--video-size-threshold":
+                config.videoSizeThreshold = parseInt(args[++i], 10);
+                break;
+            case "--video-timeout":
+                config.videoTimeout = parseInt(args[++i], 10);
+                break;
+            case "--help":
+            case "-h":
+                console.log(`
+用法: node twitter-bookmarks.mjs [选项]
+
+选项:
+  --port, -p <port>         Chrome 调试端口 (默认: 读取 /tmp/chrome-debug-port 或 9222)
+  --count, -c <n>           提取书签数量 (默认: 10)
+  --output, -o <file>       输出到 JSON 文件
+  --obsidian                保存到 Obsidian vault
+  --obsidian-path <path>    Obsidian 保存路径 (默认: Inbox/X Bookmarks)
+  --no-video-download      不下载视频（只保存缩略图）
+  --video-dir <dir>         视频保存目录 (默认: videos/)
+  --video-size-threshold <bytes>  视频大小阈值，超过则跳过 (默认: 524288000 = 500MB)
+  --video-timeout <ms>         视频下载超时 (默认: 600000 = 10分钟)
+  --help, -h                显示帮助
+`);
+                process.exit(0);
+        }
+    }
+
+    if (!config.port) {
+        try {
+            config.port = parseInt(
+                readFileSync("/tmp/chrome-debug-port", "utf-8").trim(),
+                10
+            );
+        } catch {
+            config.port = 9222;
+        }
+    }
+
+    // 确保视频目录存在
+    if (!existsSync(config.videoDir)) {
+        mkdirSync(config.videoDir, { recursive: true });
+    }
+
+    return config;
+}
+
+// ---- 下载视频函数 ----
+function downloadVideo(url, filepath, tweetUrl = null, timeout = 600000) {
+    return new Promise((resolve, reject) => {
+        // 检查是否应该使用 yt-dlp（Twitter/X URL 或分片文件）
+        const shouldUseYtdlp = url.includes('.m4s') || 
+                              url.includes('twitter.com') || 
+                              url.includes('x.com') ||
+                              (tweetUrl && (tweetUrl.includes('twitter.com') || tweetUrl.includes('x.com')));
+        
+        if (shouldUseYtdlp) {
+            console.log(`  ⚠️ 使用 yt-dlp 下载 Twitter 视频...`);
+            // 优先使用传入的 tweetUrl，否则使用 url 作为 Twitter URL
+            const twitterUrl = tweetUrl || url;
+            return downloadVideoWithYtdlp(url, filepath, twitterUrl, reject, resolve, timeout);
+        }
+        
+        const protocol = url.startsWith('https') ? https : http;
+        
+        const request = protocol.get(url, (response) => {
+            // 处理重定向
+            if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+                console.log(`  📍 重定向到: ${response.headers.location.substring(0, 50)}...`);
+                downloadVideo(response.headers.location, filepath)
+                    .then(resolve)
+                    .catch(reject);
+                return;
+            }
+            
+            if (response.statusCode !== 200) {
+                reject(new Error(`HTTP ${response.statusCode}`));
+                return;
+            }
+
+            const fileStream = createWriteStream(filepath);
+            response.pipe(fileStream);
+            
+            fileStream.on('finish', () => {
+                fileStream.close();
+                resolve(filepath);
+            });
+            
+            fileStream.on('error', (err) => {
+                fileStream.close();
+                reject(err);
+            });
+        });
+
+        request.on('error', reject);
+        request.setTimeout(60000, () => {
+            request.destroy();
+            reject(new Error('下载超时'));
+        });
+    });
+}
+
+// ---- 使用 yt-dlp 下载视频 ----
+function downloadVideoWithYtdlp(segmentUrl, filepath, inputTwitterUrl, reject, resolve, timeout = 600000) {
+    // 优先使用传入的推文URL，否则从分片URL提取
+    let twitterUrl = inputTwitterUrl;
+    let videoId = null;
+    
+    if (!twitterUrl) {
+        const videoIdMatch = segmentUrl.match(/amplify_video\/([a-zA-Z0-9_-]+)\//);
+        if (videoIdMatch) {
+            videoId = videoIdMatch[1];
+            twitterUrl = `https://twitter.com/i/status/${videoId}`;
+        }
+    }
+    
+    if (!twitterUrl) {
+        reject(new Error('无法获取推文URL'));
+        return;
+    }
+    
+    console.log(`  🎯 使用推文URL下载: ${twitterUrl}`);
+    
+    // 使用 yt-dlp 下载， 使用 worst 格式确保能下载
+    const ytdlp = spawn('yt-dlp', [
+        '--output', filepath,
+        '--format', 'worst',
+        '--no-playlist',
+        '--timeout', String(Math.floor(timeout / 1000)),
+        twitterUrl
+    ]);
+    
+    let stderr = '';
+    let finished = false;
+    
+    // 超时处理
+    const timeoutId = setTimeout(() => {
+        if (!finished) {
+            finished = true;
+            ytdlp.kill();
+            console.error(`  ❌ yt-dlp 下载超时 (${timeout / 1000}s)，终止`);
+            reject(new Error(`下载超时 (${timeout / 1000}s)`));
+        }
+    }, timeout);
+    
+    ytdlp.stderr.on('data', (data) => {
+        stderr += data.toString();
+    });
+    
+    ytdlp.on('close', (code) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timeoutId);
+        
+        if (code === 0) {
+            console.log(`  ✅ yt-dlp 下载完成: ${filepath}`);
+            resolve(filepath);
+        } else {
+            const errorMsg = stderr.substring(0, 200);
+            console.error(`  ❌ yt-dlp 失败: ${errorMsg}`);
+            reject(new Error(`yt-dlp 失败 (code ${code}): ${errorMsg}`));
+        }
+    });
+    
+    ytdlp.on('error', (err) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timeoutId);
+        console.error(`  ❌ yt-dlp 启动失败: ${err.message}`);
+        reject(err);
+    });
+}
+
+// ---- 从缩略图提取视频 ID ----
+function extractVideoId(posterUrl) {
+    if (!posterUrl) return null;
+    const match = posterUrl.match(/\/([a-zA-Z0-9_]+)\/img\//);
+    return match ? match[1] : null;
+}
+
+// ---- 获取视频大小信息（不下载） ----
+function getVideoSize(tweetUrl, timeout = 20000) {
+    return new Promise((resolve) => {
+        const ytdlp = spawn('yt-dlp', [
+            '--dump-json',
+            '--no-playlist',
+            tweetUrl
+        ], { timeout: timeout });
+        
+        let stdout = '';
+        let stderr = '';
+        
+        ytdlp.stdout.on('data', (data) => {
+            stdout += data.toString();
+        });
+        
+        ytdlp.stderr.on('data', (data) => {
+            stderr += data.toString();
+        });
+        
+        const timeoutId = setTimeout(() => {
+            ytdlp.kill();
+            resolve({ error: '获取视频信息超时' });
+        }, timeout);
+        
+        ytdlp.on('close', (code) => {
+            clearTimeout(timeoutId);
+            if (code === 0) {
+                try {
+                    const info = JSON.parse(stdout);
+                    if (info && info.filesize) {
+                        resolve({ 
+                            size: info.filesize,
+                            duration: info.duration,
+                            format: info.format
+                        });
+                    } else {
+                        resolve({ error: '无法获取文件大小' });
+                    }
+                } catch (e) {
+                    resolve({ error: `解析视频信息失败: ${e.message}` });
+                }
+            } else {
+                resolve({ error: stderr || 'yt-dlp 执行失败' });
+            }
+        });
+        
+        ytdlp.on('error', (err) => {
+            clearTimeout(timeoutId);
+            resolve({ error: err.message });
+        });
+    });
+}
+
+// ---- 连接 Chrome ----
+async function connectChrome(port) {
+    const debugUrl = `http://localhost:${port}`;
+    console.log(`🔌 连接 Chrome 调试端口: ${debugUrl}`);
+
+    try {
+        const browser = await puppeteer.connect({
+            browserURL: debugUrl,
+            defaultViewport: null,
+        });
+        console.log("✅ 已连接到 Chrome");
+        return browser;
+    } catch (err) {
+        console.error("❌ 连接失败:", err.message);
+        console.error("请确保 Chrome 已启动: ./launch-chrome.sh --yes");
+        process.exit(1);
+    }
+}
+
+// ---- 提取单个推文内容 ----
+async function extractTweetContent(page, tweetElement, capturedVideoUrls = new Set(), config = {}) {
+    try {
+        // 首先尝试点击 "Show more" 按钮（如果有）
+        let showMoreClicked = false;
+        
+        try {
+            showMoreClicked = await page.evaluate((el) => {
+                // 方法1: 通过 data-testid 查找
+                const showMoreBtn = el.querySelector('[data-testid="tweet-text-show-more-link"]');
+                if (showMoreBtn) {
+                    showMoreBtn.click();
+                    return true;
+                }
+                
+                // 方法2: 通过文本内容查找所有按钮和链接
+                const allButtons = el.querySelectorAll('button, a, span');
+                for (const btn of allButtons) {
+                    const text = (btn.innerText || btn.textContent || '').toLowerCase().trim();
+                    if (text === 'show more' || text === '显示更多' || 
+                        text.includes('show more') || text.includes('显示更多')) {
+                        btn.click();
+                        return true;
+                    }
+                }
+                return false;
+            }, tweetElement);
+            
+            if (showMoreClicked) {
+                // 等待内容展开
+                await new Promise(resolve => setTimeout(resolve, 800));
+            }
+        } catch (clickErr) {
+            console.log("点击 Show more 按钮时出错（可能不存在）:", clickErr.message);
+        }
+
+        const content = await page.evaluate((el, wasExpanded) => {
+            // 提取所有文本（可能有多个：主推文 + 引用推文）
+            const textEls = el.querySelectorAll('[data-testid="tweetText"]');
+            
+            let text = "";
+            let quotedText = null;
+            let debugInfo = { tweetTextCount: textEls.length, hasQuote: false };
+            
+            if (textEls.length >= 2) {
+                // 第一个是主推文，第二个是引用推文
+                text = textEls[0].innerText || textEls[0].textContent || "";
+                quotedText = textEls[1].innerText || textEls[1].textContent || "";
+                debugInfo.hasQuote = true;
+            } else if (textEls.length === 1) {
+                text = textEls[0].innerText || textEls[0].textContent || "";
+            }
+
+            // 提取作者信息
+            const userNameEl = el.querySelector('[data-testid="User-Name"]');
+            let author = "";
+            let handle = "";
+            if (userNameEl) {
+                const links = userNameEl.querySelectorAll('a');
+                if (links.length > 0) {
+                    handle = links[0].getAttribute('href')?.replace('/', '') || '';
+                }
+                author = userNameEl.innerText.split('\n')[0];
+            }
+
+            // 提取时间
+            const timeEl = el.querySelector('time');
+            const timestamp = timeEl ? timeEl.getAttribute('datetime') : '';
+            
+            // 提取推文链接
+            let tweetUrl = '';
+            if (timeEl && timeEl.parentElement) {
+                const link = timeEl.parentElement;
+                if (link.tagName === 'A' || link.closest('a')) {
+                    const anchor = link.tagName === 'A' ? link : link.closest('a');
+                    tweetUrl = anchor ? anchor.href : '';
+                }
+            }
+
+            // 提取图片 - 获取原始质量
+            const images = Array.from(el.querySelectorAll('[data-testid="tweetPhoto"] img')).map(
+                (img) => {
+                    let url = img.src;
+                    // 将缩略图 URL 转换为原始质量
+                    // Twitter 图片 URL: .../media/xxxxx.jpg?name=small 或 name=medium
+                    // 替换为 name=orig 获取原始质量
+                    if (url.includes('pbs.twimg.com/media/') || url.includes('pic.twitter.com/')) {
+                        // 移除现有的 name 参数，添加 name=orig
+                        url = url.replace(/\?name=[^&]+/, '?name=orig');
+                        url = url.replace(/&name=[^&]+/, '');
+                        if (!url.includes('name=orig')) {
+                            url += (url.includes('?') ? '&' : '?') + 'name=orig';
+                        }
+                    }
+                    return url;
+                }
+            );
+            
+            // 提取视频 - 需要去重
+            const videos = [];
+            
+            // 辅助函数：检查视频是否已存在
+            const hasVideo = (thumbUrl) => {
+                return videos.some(v => v.thumbnail === thumbUrl);
+            };
+            
+            // 方法1: 查找视频元素（带 poster 属性）
+            const videoElements = el.querySelectorAll('video');
+            videoElements.forEach((video, idx) => {
+                const src = video.src || video.querySelector('source')?.src;
+                const poster = video.getAttribute('poster') || video.poster;
+                // 从 poster URL 提取视频 ID
+                let videoId = null;
+                if (poster) {
+                    const match = poster.match(/\/([a-zA-Z0-9_-]+)\/img\//);
+                    if (match) videoId = match[1];
+                }
+                if ((src || poster) && !hasVideo(poster)) {
+                    videos.push({ 
+                        type: 'direct', 
+                        url: src, 
+                        thumbnail: poster,
+                        videoId: videoId
+                    });
+                }
+            });
+            
+            // 方法2: 查找视频容器（Twitter/X 使用 div[data-testid="videoPlayer"]）
+            const videoContainers = el.querySelectorAll('[data-testid="videoPlayer"]');
+            videoContainers.forEach((container, index) => {
+                // 尝试获取视频缩略图
+                const thumb = container.querySelector('img');
+                const thumbUrl = thumb ? thumb.src : null;
+                
+                // 去重：如果已存在相同 thumbnail 的视频，跳过
+                if (hasVideo(thumbUrl)) return;
+                
+                // 尝试获取视频 URL（从属性或子元素）
+                let videoUrl = null;
+                const videoEl = container.querySelector('video');
+                if (videoEl) {
+                    videoUrl = videoEl.src || videoEl.getAttribute('data-url');
+                }
+                
+                videos.push({
+                    type: 'twitter_video',
+                    thumbnail: thumbUrl,
+                    url: videoUrl,
+                    note: videoUrl ? '视频链接已提取' : '视频需要在Twitter上查看'
+                });
+            });
+            
+            // 方法3: 查找 GIF 动图
+            const gifContainers = el.querySelectorAll('[data-testid="gifPlayer"]');
+            gifContainers.forEach((container, index) => {
+                const gifImg = container.querySelector('img');
+                if (gifImg) {
+                    // GIF 也需要去重
+                    if (hasVideo(gifImg.src)) return;
+                    videos.push({
+                        type: 'gif',
+                        thumbnail: gifImg.src,
+                        note: 'GIF 动图'
+                    });
+                }
+            });
+            
+            // 为视频添加索引
+            videos.forEach((v, idx) => v.index = idx + 1);
+
+            // 提取链接（排除 Twitter 内部链接）
+            const links = Array.from(el.querySelectorAll('a[href^="http"]'))
+                .filter(a => !a.href.includes('twitter.com') && !a.href.includes('x.com'))
+                .map((a) => ({
+                    text: a.innerText,
+                    url: a.href,
+                }));
+
+            // 提取引用帖子（quoted tweet）
+            let quotedTweet = null;
+            
+            // 如果有多个 tweetText 元素，第2个是引用推文
+            if (quotedText) {
+                // 收集所有 /status/ 链接
+                const allStatusLinks = [];
+                const allLinks = el.querySelectorAll('a[href]');
+                allLinks.forEach(l => {
+                    const href = l.href;
+                    if (href && href.includes('/status/') && !href.includes('/analytics') && !href.includes('/photo/')) {
+                        allStatusLinks.push(href);
+                    }
+                });
+                
+                // 提取引用帖的链接 - 找指向 /status/ 且 ID 不同的链接
+                let quoteUrl = '';
+                let quoteHandle = '';
+                const tweetId = tweetUrl.match(/\/status\/(\d+)/)?.[1];
+                
+                allStatusLinks.forEach(href => {
+                    const linkId = href.match(/\/status\/(\d+)/)?.[1];
+                    if (tweetId && linkId && tweetId !== linkId && !quoteUrl) {
+                        quoteUrl = href;
+                        const match = href.match(/x\.com\/([^\/]+)\/status\//);
+                        if (match) {
+                            quoteHandle = match[1];
+                        }
+                    }
+                });
+                
+                // 如果没找到，尝试找包含 @ 的链接文本
+                if (!quoteHandle) {
+                    allLinks.forEach(l => {
+                        const text = l.innerText || '';
+                        const href = l.href || '';
+                        if (text.startsWith('@') && !quoteHandle) {
+                            quoteHandle = text.replace('@', '');
+                        }
+                    });
+                }
+                
+                // 尝试从引用内容附近获取作者名
+                let quoteAuthor = '';
+                const quoteContainer = el.querySelector('[data-testid="tweetText"]')?.parentElement?.nextElementSibling;
+                if (quoteContainer) {
+                    const nameEl = quoteContainer.querySelector('[data-testid="User-Name"]') || quoteContainer.querySelector('span') || quoteContainer.querySelector('a');
+                    if (nameEl) {
+                        quoteAuthor = nameEl.innerText.split('\n')[0];
+                    }
+                }
+                
+                // 如果还是没找到，从链接 URL 推断
+                if (!quoteAuthor && quoteHandle) {
+                    quoteAuthor = quoteHandle;
+                }
+                
+                // 如果 handle 还是没找到，尝试从引用文本中提取 @mentions
+                if (!quoteHandle && quotedText) {
+                    const mentionMatch = quotedText.match(/@([a-zA-Z0-9_]+)/);
+                    if (mentionMatch) {
+                        quoteHandle = mentionMatch[1];
+                        quoteAuthor = quoteHandle;
+                    }
+                }
+                
+                // Fallback: 从文本内容中提取引用推文 URL
+                function extractQuoteUrlFromText(text, mainTweetUrl) {
+                    if (!text) return '';
+                    
+                    // 匹配 x.com/handle/status/... 格式
+                    const match = text.match(/(x\.com\/[a-zA-Z0-9_]+)\/status\//);
+                    if (match) {
+                        const handle = match[1];
+                        // 尝试获取完整的 status ID（可能被截断）
+                        const statusMatch = text.match(/status\/(\d+)/);
+                        if (statusMatch) {
+                            return `https://${handle}/status/${statusMatch[1]}`;
+                        }
+                        // 如果没找到 status ID，至少返回 handle
+                        return `https://${handle}`;
+                    }
+                    return '';
+                }
+                
+                quotedTweet = {
+                    author: quoteAuthor,
+                    handle: quoteHandle,
+                    text: quotedText,
+                    url: quoteUrl || extractQuoteUrlFromText(quotedText, tweetUrl)
+                };
+            }
+
+            // 提取引用帖子（quoted tweet）
+            if (quotedTweet) {
+                console.log(`  💬 检测到引用帖子: @${quotedTweet.handle}`);
+            }
+            
+            // 提取互动数据
+            const stats = {};
+            const replyBtn = el.querySelector('[data-testid="reply"]');
+            const retweetBtn = el.querySelector('[data-testid="retweet"]');
+            const likeBtn = el.querySelector('[data-testid="like"]');
+
+            if (replyBtn) {
+                const count = replyBtn.innerText.match(/\d+/);
+                stats.replies = count ? parseInt(count[0]) : 0;
+            }
+            if (retweetBtn) {
+                const count = retweetBtn.innerText.match(/\d+/);
+                stats.retweets = count ? parseInt(count[0]) : 0;
+            }
+            if (likeBtn) {
+                const count = likeBtn.innerText.match(/\d+/);
+                stats.likes = count ? parseInt(count[0]) : 0;
+            }
+
+            return {
+                author,
+                handle,
+                text,
+                timestamp,
+                tweetUrl,
+                images,
+                videos,
+                links,
+                quotedTweet,
+                stats,
+                expanded: wasExpanded,
+                debugInfo
+            };
+        }, tweetElement, showMoreClicked);
+
+        // 为视频添加下载 URL - 始终使用 yt-dlp 下载完整视频
+        if (capturedVideoUrls && content.videos) {
+            console.log(`  📡 已捕获 ${capturedVideoUrls.size} 个视频 URL`);
+            console.log(`  📋 捕获的URL示例: ${Array.from(capturedVideoUrls).slice(0, 2).join(', ')}`);
+            for (const video of content.videos) {
+                // 从 poster URL 或直接获取的 videoId 提取视频 ID
+                let videoId = video.videoId || extractVideoId(video.thumbnail);
+                console.log(`  🎬 处理视频: videoId=${videoId || '无'}, thumbnail=${video.thumbnail ? '有' : '无'}`);
+                
+                // 始终使用 yt-dlp 下载完整视频
+                // 将 tweetUrl 存储为 "use-ytdlp" 标记，downloadVideo 函数会识别并使用 yt-dlp
+                if (content.tweetUrl && !content.tweetUrl.startsWith('blob:')) {
+                    video.downloadUrl = content.tweetUrl;  // 使用推文URL触发 yt-dlp
+                    video.useYtdlp = true;
+                    console.log(`  🎯 将使用 yt-dlp 下载完整视频`);
+                }
+            }
+        }
+
+        return content;
+    } catch (err) {
+        console.error("提取推文内容失败:", err.message);
+        return null;
+    }
+}
+
+// ---- 提取引用推文的完整内容 ----
+async function extractQuotedTweetFullContent(page, tweetElement) {
+    try {
+        // 检查是否有引用推文
+        const hasQuote = await tweetElement.evaluate(el => {
+            const textEls = el.querySelectorAll('[data-testid="tweetText"]');
+            return textEls.length >= 2;
+        });
+        
+        if (!hasQuote) {
+            return null;
+        }
+        
+        console.log("  💬 检测到引用推文...");
+        
+        // 先检查是否有 "View Post" 链接（外部引用才有）
+        const quoteInfo = await tweetElement.evaluate(el => {
+            // 找 "View post" 链接
+            const allLinks = Array.from(el.querySelectorAll('a[href]'));
+            const viewPostLink = allLinks.find(l => 
+                l.innerText.toLowerCase().includes('view post') || 
+                l.innerText.includes('查看帖子')
+            );
+            
+            if (viewPostLink) {
+                return { hasViewPost: true, url: viewPostLink.href };
+            }
+            
+            // 没有 View Post = 自引用，不需要点进去
+            return { hasViewPost: false, url: null };
+        });
+        
+        if (!quoteInfo.hasViewPost) {
+            console.log("  💬 自引用推文，使用已有内容");
+            return null;
+        }
+        
+        console.log(`  🔗 引用推文 URL: ${quoteInfo.url.substring(0, 60)}...`);
+        
+        // 有 View Post，点击进入获取完整内容
+        await page.goto(quoteInfo.url, { waitUntil: 'networkidle2', timeout: 15000 });
+        
+        // 等待推文加载
+        await page.waitForSelector('article[data-testid="tweet"]', { timeout: 10000 });
+        await new Promise(r => setTimeout(r, 1500));
+        
+        // 获取当前页面的推文内容
+        const quoteContent = await page.evaluate(() => {
+            const article = document.querySelector('article[data-testid="tweet"]');
+            if (!article) return null;
+            
+            const textEls = article.querySelectorAll('[data-testid="tweetText"]');
+            const text = textEls.length > 0 ? (textEls[0].innerText || textEls[0].textContent || '') : '';
+            
+            const userNameEl = article.querySelector('[data-testid="User-Name"]');
+            let author = '';
+            let handle = '';
+            if (userNameEl) {
+                const links = userNameEl.querySelectorAll('a');
+                if (links.length > 0) {
+                    handle = links[0].getAttribute('href')?.replace('/', '') || '';
+                }
+                author = userNameEl.innerText.split('\n')[0];
+            }
+            
+            const timeEl = article.querySelector('time');
+            const timestamp = timeEl ? timeEl.getAttribute('datetime') : '';
+            
+            // 提取图片 - 获取原始质量
+            const images = Array.from(article.querySelectorAll('[data-testid="tweetPhoto"] img')).map(img => {
+                let url = img.src;
+                // 将缩略图 URL 转换为原始质量
+                if (url.includes('pbs.twimg.com/media/') || url.includes('pic.twitter.com/')) {
+                    url = url.replace(/\?name=[^&]+/, '?name=orig');
+                    url = url.replace(/&name=[^&]+/, '');
+                    if (!url.includes('name=orig')) {
+                        url += (url.includes('?') ? '&' : '?') + 'name=orig';
+                    }
+                }
+                return url;
+            });
+            
+            // 提取视频
+            const videos = [];
+            const videoContainers = article.querySelectorAll('[data-testid="videoPlayer"]');
+            videoContainers.forEach(container => {
+                const thumb = container.querySelector('img');
+                videos.push({
+                    type: 'twitter_video',
+                    thumbnail: thumb ? thumb.src : null,
+                    url: null
+                });
+            });
+            
+            return {
+                author,
+                handle,
+                text,
+                timestamp,
+                tweetUrl: window.location.href,
+                images,
+                videos
+            };
+        });
+        
+        if (quoteContent) {
+            console.log(`  ✅ 引用推文完整内容已获取: @${quoteContent.handle}`);
+        }
+        
+        // 返回书签页面
+        await page.goBack();
+        
+        // 等待书签页面重新加载
+        await page.waitForSelector('article[data-testid="tweet"]', { timeout: 10000 });
+        await new Promise(r => setTimeout(r, 1000));
+        
+        return quoteContent;
+        
+    } catch (err) {
+        console.error("  ❌ 获取引用推文失败:", err.message);
+        try {
+            await page.goBack();
+        } catch (e) {}
+        return null;
+    }
+}
+
+// ---- 主函数 ----
+async function main() {
+    const config = parseArgs();
+    console.log(`📚 X 书签提取器 — 计划提取 ${config.count} 个书签\n`);
+    console.log(`📹 视频下载: ${config.downloadVideos ? '启用' : '禁用'}\n`);
+
+    const browser = await connectChrome(config.port);
+
+    try {
+        // 获取或创建页面
+        const pages = await browser.pages();
+        const page = pages.length > 0 ? pages[0] : await browser.newPage();
+
+        // 用于存储捕获的视频 URL
+        const capturedVideoUrls = new Set();
+
+        // 启用网络请求拦截以捕获视频 URL
+        if (config.downloadVideos) {
+            await page.setRequestInterception(true);
+            page.on('request', request => {
+                const url = request.url();
+                // 捕获视频片段请求（.mp4, .m4s）
+                if (url.includes('.mp4') || url.includes('.m4s')) {
+                    if (!capturedVideoUrls.has(url)) {
+                        capturedVideoUrls.add(url);
+                    }
+                }
+                request.continue();
+            });
+        }
+
+        // 访问书签页面
+        console.log("🌐 正在访问 X 书签页面...");
+        await page.goto("https://twitter.com/i/bookmarks", {
+            waitUntil: "networkidle2",
+            timeout: 30000,
+        });
+
+        // 等待推文加载
+        console.log("⏳ 等待页面加载...");
+        await page.waitForSelector('article[data-testid="tweet"]', {
+            timeout: 10000,
+        });
+
+        // 短暂等待让视频请求发出
+        if (config.downloadVideos) {
+            console.log("⏳ 等待视频请求发出...");
+            await new Promise(r => setTimeout(r, 2000));
+        }
+
+        const bookmarks = [];
+        // 关键修复：使用 Set 跟踪已处理的唯一推文 URL，而不是计数可见元素
+        const processedTweetUrls = new Set();
+        let noNewTweetsCount = 0;
+
+        console.log(`📜 开始提取书签 (目标: ${config.count} 个)...\n`);
+
+        while (bookmarks.length < config.count) {
+            // 获取当前视口中所有推文元素
+            const tweetElements = await page.$$('article[data-testid="tweet"]');
+            console.log(`📊 当前视口有 ${tweetElements.length} 个可见书签，已处理 ${processedTweetUrls.size} 个唯一书签`);
+
+            // 先提取所有可见推文的 URL
+            const visibleTweetData = [];
+            for (let i = 0; i < tweetElements.length; i++) {
+                const tweetUrl = await tweetElements[i].evaluate(el => {
+                    const timeEl = el.querySelector('time');
+                    if (timeEl && timeEl.parentElement) {
+                        const link = timeEl.parentElement;
+                        if (link.tagName === 'A' || link.closest('a')) {
+                            const anchor = link.tagName === 'A' ? link : link.closest('a');
+                            return anchor ? anchor.href : '';
+                        }
+                    }
+                    return '';
+                });
+                visibleTweetData.push({ element: tweetElements[i], url: tweetUrl });
+            }
+
+            // 找出未处理的新推文
+            let newTweetsFound = 0;
+            for (const { element, url } of visibleTweetData) {
+                if (bookmarks.length >= config.count) break;
+                
+                // 跳过已处理的推文
+                if (!url || processedTweetUrls.has(url)) {
+                    continue;
+                }
+                
+                // 标记为已处理
+                processedTweetUrls.add(url);
+                newTweetsFound++;
+
+                // 提取推文内容
+                const tweet = await extractTweetContent(page, element, capturedVideoUrls, config);
+                if (tweet) {
+                    tweet.index = bookmarks.length + 1;
+                    
+                    // 调试输出
+                    if (tweet.debugInfo) {
+                        console.log(`  🔍 [DEBUG] tweetTextCount=${tweet.debugInfo.tweetTextCount}, hasQuote=${tweet.debugInfo.hasQuote}`);
+                    }
+                    
+                    // 如果有引用推文，获取完整内容
+                    if (tweet.debugInfo && tweet.debugInfo.hasQuote) {
+                        const quoteFullContent = await extractQuotedTweetFullContent(page, element);
+                        if (quoteFullContent) {
+                            tweet.quotedTweetFull = quoteFullContent;
+                            console.log(`  ✅ 引用推文完整内容: @${quoteFullContent.handle}`);
+                        }
+                    }
+                    
+                    // 下载视频（如果启用）- 使用 videoId 生成唯一文件名
+                    if (config.downloadVideos && tweet.videos && tweet.videos.length > 0) {
+                        console.log(`  📹 检测到 ${tweet.videos.length} 个视频，尝试下载...`);
+                        console.log(`  🔗 推文URL: ${tweet.tweetUrl}`);
+                        
+                        // 用于跟踪已下载的 videoId
+                        const downloadedVideoIds = new Set();
+                        
+                        for (const video of tweet.videos) {
+                            console.log(`    🔍 视频详情: thumbnail=${video.thumbnail ? '有' : '无'}, url=${video.url ? '有' : '无'}`);
+                            if (video.downloadUrl) {
+                                // 使用 videoId 或 thumbnail 生成唯一文件名
+                                const videoId = video.videoId || extractVideoId(video.thumbnail) || `video_${Date.now()}`;
+                                
+                                try {
+                                    const filename = `${tweet.handle}_${videoId}.mp4`;
+                                    const filepath = path.join(config.videoDir, filename);
+                                    
+                                    // 如果文件已存在，跳过
+                                    if (existsSync(filepath)) {
+                                        video.localPath = filepath;
+                                        console.log(`    ⏭️ 文件已存在，跳过: ${filename}`);
+                                        continue;
+                                    }
+                                    
+                                    // 获取视频大小（先检查是否过大）
+                                    console.log(`    📏 检查视频大小...`);
+                                    const videoSizeInfo = await getVideoSize(tweet.tweetUrl, config.videoTimeout / 3);
+                                    
+                                    if (videoSizeInfo.error) {
+                                        console.log(`    ⚠️  无法获取视频大小: ${videoSizeInfo.error}`);
+                                        // 继续下载
+                                    } else if (videoSizeInfo.size > config.videoSizeThreshold) {
+                                        console.log(`    ⚠️  视频过大 (${(videoSizeInfo.size / 1024 / 1024).toFixed(1)}MB)，超过阈值 (${(config.videoSizeThreshold / 1024 / 1024).toFixed(1)}MB)`);
+                                        console.log(`    💾 已保存推文链接，用户可手动下载完整视频`);
+                                        video.tooLarge = true;
+                                        continue;
+                                    }
+                                    
+                                    console.log(`    ⬇️ 下载视频: ${filename} (${(videoSizeInfo.size / 1024 / 1024).toFixed(1)}MB)`);
+                                    await downloadVideo(video.downloadUrl, filepath, tweet.tweetUrl, config.videoTimeout);
+                                    video.localPath = filepath;
+                                    downloadedVideoIds.add(videoId);
+                                    console.log(`    ✅ 已下载: ${filepath}`);
+                                } catch (e) {
+                                    console.error(`    ❌ 下载失败: ${e.message}`);
+                                }
+                            }
+                        }
+                    }
+                    
+                    bookmarks.push(tweet);
+                    console.log(`✅ [${bookmarks.length}/${config.count}] @${tweet.handle}: ${tweet.text.substring(0, 50)}...`);
+                }
+            }
+
+            // 检查是否没有新内容了（基于唯一 URL，而不是可见元素数量）
+            if (newTweetsFound === 0) {
+                noNewTweetsCount++;
+                console.log(`  ⚠️ 本轮未发现新书签 (${noNewTweetsCount}/3)`);
+                if (noNewTweetsCount >= 3) {
+                    console.log("\n⚠️  连续3次未发现新书签，停止提取");
+                    break;
+                }
+            } else {
+                noNewTweetsCount = 0;
+            }
+
+            // 滚动加载更多
+            if (bookmarks.length < config.count && noNewTweetsCount < 3) {
+                console.log(`📜 滚动加载更多... (已收集 ${bookmarks.length}/${config.count})`);
+                await page.evaluate(() => {
+                    window.scrollBy({ top: window.innerHeight * 0.8, behavior: 'smooth' });
+                });
+                await new Promise((resolve) => setTimeout(resolve, config.scrollDelay));
+            }
+        }
+
+        console.log(`\n🎉 提取完成！共 ${bookmarks.length} 个书签`);
+
+        // 保存结果
+        const result = {
+            extractedAt: new Date().toISOString(),
+            count: bookmarks.length,
+            bookmarks,
+        };
+
+        if (config.output) {
+            writeFileSync(config.output, JSON.stringify(result, null, 2));
+            console.log(`💾 已保存到: ${config.output}`);
+        }
+
+        // 保存到 Obsidian
+        if (config.obsidian) {
+            console.log("\n📝 正在保存到 Obsidian...");
+            for (const bookmark of bookmarks) {
+                const date = new Date(bookmark.timestamp).toISOString().split('T')[0];
+                const safeHandle = bookmark.handle.replace(/[^a-zA-Z0-9]/g, '_');
+                const safeTitle = bookmark.text.substring(0, 30).replace(/[^\w\s]/g, '').trim();
+                // 从推文URL提取状态ID作为唯一标识
+                const tweetId = bookmark.tweetUrl?.match(/\/status\/(\d+)/)?.[1] || Date.now();
+                const filename = `${date} - @${safeHandle} - ${tweetId}.md`;
+                const filepath = path.join(config.obsidianPath, filename);
+
+                // 构建视频部分 - 去重：优先用 downloadUrl 过滤
+                let videoSection = '';
+                if (bookmark.videos && bookmark.videos.length > 0) {
+                    // 去重：downloadUrl 相同则视为重复
+                    const uniqueVideos = [];
+                    const seenDownloadUrls = new Set();
+                    for (const v of bookmark.videos) {
+                        const key = v.downloadUrl || v.thumbnail || v.url;
+                        if (!seenDownloadUrls.has(key)) {
+                            seenDownloadUrls.add(key);
+                            uniqueVideos.push(v);
+                        }
+                    }
+                    
+                    if (uniqueVideos.length > 0) {
+                        videoSection = '## 🎬 视频\n\n';
+                        uniqueVideos.forEach((video, idx) => {
+                            // 处理所有视频类型（twitter_video, direct, gif）
+                            if (video.type === 'twitter_video' || video.type === 'direct') {
+                                videoSection += `### 视频 ${idx + 1}\n`;
+                                // 显示缩略图
+                                if (video.thumbnail) {
+                                    videoSection += `![视频缩略图](${video.thumbnail})\n\n`;
+                                }
+                                // 使用 Obsidian 嵌入语法直接播放视频
+                                if (video.localPath) {
+                                    // 提取文件名
+                                    const videoFilename = path.basename(video.localPath);
+                                    // 使用相对路径嵌入视频
+                                    videoSection += `![[videos/${videoFilename}]]\n\n`;
+                                } else if (video.downloadUrl) {
+                                    videoSection += `📥 **下载地址**: ${video.downloadUrl.substring(0, 80)}...\n\n`;
+                                } else if (video.url && video.url.startsWith('blob:')) {
+                                    videoSection += `*视频需要在Twitter上查看*\n\n`;
+                                } else if (video.url) {
+                                    videoSection += `[视频链接](${video.url})\n\n`;
+                                }
+                            } else if (video.type === 'gif') {
+                                videoSection += `### GIF ${idx + 1}\n`;
+                                if (video.thumbnail) {
+                                    videoSection += `![](${video.thumbnail})\n`;
+                                }
+                                videoSection += `*${video.note || 'GIF 动图'}*\n\n`;
+                            }
+                        });
+                    }
+                }
+
+                // 展开标记
+                const expandedNote = bookmark.expanded ? '\n*✅ 已展开完整内容*' : '';
+                
+                // 清理推文文本
+                function cleanTweetText(text) {
+                    if (!text) return '';
+                    const lines = text.split('\n').map(l => l.trim()).filter(l => l);
+                    const paragraphs = [];
+                    for (let line of lines) {
+                        // 如果上一段末尾是 @xxx 或 @xxx. 且这一行以 . 开头或小写字母开头，合并
+                        const last = paragraphs[paragraphs.length - 1];
+                        if (last && (last.match(/@[a-zA-Z0-9_]+\.?$/) || last.match(/@[a-zA-Z0-9_]+\.\s*$/)) 
+                            && (line.match(/^[a-z]/) || line.startsWith('.'))) {
+                            paragraphs[paragraphs.length - 1] = last + ' ' + line.replace(/^\.+/, '').trim();
+                        } else {
+                            paragraphs.push(line);
+                        }
+                    }
+                    return paragraphs.join('\n\n');
+                }
+                
+                const mainText = cleanTweetText(bookmark.text);
+                const quoteText = bookmark.quotedTweet ? cleanTweetText(bookmark.quotedTweet.text) : '';
+
+                const content = `---
+type: x-bookmark
+author: "@${bookmark.handle}"
+name: "${bookmark.author}"
+date: "${date}"
+url: "https://twitter.com/${bookmark.handle}/status/${Date.now()}"
+likes: ${bookmark.stats.likes || 0}
+retweets: ${bookmark.stats.retweets || 0}
+replies: ${bookmark.stats.replies || 0}
+media_count: ${(bookmark.images?.length || 0) + (bookmark.videos?.length || 0)}
+---
+
+# ${bookmark.author} (@${bookmark.handle})${expandedNote}
+
+${mainText.split('\n\n').map(p => p.split('\n').map(l => `> ${l}`).join('\n')).join('\n\n')}
+
+${bookmark.images.length > 0 ? '## 📷 图片\n\n' + bookmark.images.map(url => `![](${url})`).join('\n\n') + '\n\n' : ''}${videoSection}${bookmark.links.length > 0 ? '## 🔗 链接\n\n' + bookmark.links.map(l => {
+    // 清理链接文本，移除换行符
+    const cleanText = (l.text || l.url).replace(/[\r\n]+/g, ' ').trim();
+    return `- [${cleanText}](${l.url})`;
+}).join('\n') + '\n\n' : ''}${bookmark.quotedTweet ? '## 💬 引用\n\n' + `> **${bookmark.quotedTweet.author}** (@${bookmark.quotedTweet.handle})\n\n` + quoteText.split('\n\n').map(p => p.split('\n').map(l => `> ${l}`).join('\n')).join('\n\n') + '\n\n' + (bookmark.quotedTweet.url ? `[查看原帖](${bookmark.quotedTweet.url})\n\n` : '') + (bookmark.quotedTweetFull ? (bookmark.quotedTweetFull.images?.length > 0 ? '### 📷 引用图片\n\n' + bookmark.quotedTweetFull.images.map(url => `![](${url})`).join('\n\n') + '\n\n' : '') + (bookmark.quotedTweetFull.videos?.length > 0 ? '### 🎬 引用视频\n\n' + bookmark.quotedTweetFull.videos.map((v, idx) => `视频 ${idx + 1}: ${v.thumbnail ? `![](${v.thumbnail})` : ''}`).join('\n\n') + '\n\n' : '') : '') : ''}---
+📅 保存时间: ${new Date().toLocaleString()}
+📱 来源: X 书签
+🔖 原链接: https://twitter.com/${bookmark.handle}
+`;
+
+                try {
+                    // 确保目录存在
+                    const dir = path.dirname(filepath);
+                    if (!existsSync(dir)) {
+                        mkdirSync(dir, { recursive: true });
+                    }
+                    
+                    // 增量保存：如果文件已存在，跳过
+                    if (existsSync(filepath)) {
+                        console.log(`⏭️ 跳过（已存在）: ${filepath}`);
+                    } else {
+                        // 直接写入文件
+                        writeFileSync(filepath, content, 'utf8');
+                        console.log(`✅ 已保存: ${filepath}`);
+                    }
+                } catch (err) {
+                    console.error(`❌ 保存失败: ${filepath}`, err.message);
+                }
+            }
+        }
+
+        // 显示结果摘要
+        console.log("\n📊 提取结果摘要:");
+        console.log("-".repeat(50));
+        bookmarks.forEach((b, i) => {
+            console.log(`${i + 1}. @${b.handle}: ${b.text.substring(0, 60)}...`);
+        });
+
+    } catch (err) {
+        console.error("\n❌ 错误:", err.message);
+        console.error(err.stack);
+    } finally {
+        await browser.disconnect();
+        console.log("\n👋 已断开与 Chrome 的连接");
+    }
+}
+
+main();
