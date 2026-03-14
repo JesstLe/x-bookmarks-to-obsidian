@@ -696,6 +696,24 @@ async function extractQuotedTweetFullContent(page, tweetElement) {
         await page.waitForSelector('article[data-testid="tweet"]', { timeout: 10000 });
         await new Promise(r => setTimeout(r, 1500));
         
+        // 点击 "Show more" 按钮展开长文章（如果有）
+        try {
+            const showMoreClicked = await page.evaluate(() => {
+                const showMoreBtn = document.querySelector('[data-testid="tweet-text-show-more-link"]');
+                if (showMoreBtn) {
+                    showMoreBtn.click();
+                    return true;
+                }
+                return false;
+            });
+            if (showMoreClicked) {
+                console.log("  📖 已点击 'Show more' 展开长文章");
+                await new Promise(r => setTimeout(r, 1000)); // 等待内容展开
+            }
+        } catch (e) {
+            // 没有按钮或点击失败，忽略
+        }
+        
         // 获取当前页面的推文内容
         const quoteContent = await page.evaluate(() => {
             const article = document.querySelector('article[data-testid="tweet"]');
