@@ -13,6 +13,7 @@
 import puppeteer from "puppeteer-core";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, createWriteStream } from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
 import { execSync, spawn } from "child_process";
 import https from "https";
 import http from "http";
@@ -163,6 +164,16 @@ function downloadVideo(url, filepath, tweetUrl = null, timeout = 600000) {
 }
 
 // ---- 使用 yt-dlp 下载视频 ----
+export function buildYtDlpDownloadArgs(filepath, twitterUrl, timeout = 600000) {
+    return [
+        '--output', filepath,
+        '--format', 'worst',
+        '--no-playlist',
+        '--socket-timeout', String(Math.floor(timeout / 1000)),
+        twitterUrl
+    ];
+}
+
 function downloadVideoWithYtdlp(segmentUrl, filepath, inputTwitterUrl, reject, resolve, timeout = 600000) {
     // 优先使用传入的推文URL，否则从分片URL提取
     let twitterUrl = inputTwitterUrl;
@@ -184,13 +195,7 @@ function downloadVideoWithYtdlp(segmentUrl, filepath, inputTwitterUrl, reject, r
     console.log(`  🎯 使用推文URL下载: ${twitterUrl}`);
     
     // 使用 yt-dlp 下载， 使用 worst 格式确保能下载
-    const ytdlp = spawn('yt-dlp', [
-        '--output', filepath,
-        '--format', 'worst',
-        '--no-playlist',
-        '--timeout', String(Math.floor(timeout / 1000)),
-        twitterUrl
-    ]);
+    const ytdlp = spawn('yt-dlp', buildYtDlpDownloadArgs(filepath, twitterUrl, timeout));
     
     let stderr = '';
     let finished = false;
@@ -1128,4 +1133,6 @@ ${bookmark.images.length > 0 ? '## 📷 图片\n\n' + bookmark.images.map(url =>
     }
 }
 
-main();
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+    main();
+}
