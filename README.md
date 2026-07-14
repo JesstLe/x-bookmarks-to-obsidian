@@ -1,126 +1,85 @@
-# X 书签保存到 Obsidian
+# X Bookmarks to Obsidian
 
-## ⚠️ 重要说明
+可靠地把 X 书签详情保存为 Obsidian 资产，并修复历史笔记中的错误原帖链接、缺损正文和媒体引用。
 
-这是**实际可用的实现**，不是草稿或规划。
-
-## 🚀 快速开始
+## 安装
 
 ```bash
-# 1. 启动 Chrome（保持登录状态）
-cd ./scripts
+cd scripts
+npm install
+brew install yt-dlp ffmpeg
+```
+
+启动复用登录态的调试 Chrome：
+
+```bash
 ./launch-chrome.sh --yes
-
-# 2. 运行书签提取脚本
-node twitter-bookmarks.mjs --count 10 --obsidian
 ```
 
-## 📁 文件结构
+## 同步
 
-```
-x-bookmarks-to-obsidian/
-├── SKILL.md                    # Skill 描述（已更新）
-├── workflow.md                # 实际工作流
-├── README.md                  # 本文件
-├── scripts/                   # 自动化脚本（已从 chrome-automation 合并）
-│   ├── launch-chrome.sh      # Chrome 启动器
-│   ├── twitter-bookmarks.mjs # X 书签提取（核心）
-│   ├── twitter-summary.mjs   # 推文采集
-│   ├── twitter-post.js       # 推文发帖
-│   ├── xiaohongshu-post.js   # 小红书发布
-│   ├── delete-tweet.js       # 删除推文
-│   └── package.json          # Node.js 依赖
-├── references/
-│   ├── extraction-patterns.md
-│   └── obsidian-template.md
-└── examples/
-    └── usage-examples.md
+```bash
+node twitter-bookmarks.mjs --count 50 --obsidian
 ```
 
-## ✨ 实际功能
+安全预演：
 
-### ✅ 已实现
-
-- **Cookie 复用** - 使用已登录的 Chrome 会话，无需重新登录
-- **完整内容提取** - 在列表页直接提取，无需逐个点击
-- **自动展开** - 点击 "显示更多" 展开长文本
-- **视频下载** - 使用 yt-dlp 下载完整视频（不是分片）
-- **本地保存** - 视频保存到 Obsidian vault 内
-- **嵌入播放** - 笔记中使用 `![[videos/xxx.mp4]]` 嵌入视频
-- **增量保存** - 跳过已存在的文件
-
-
-## 📝 输出示例
-
-```markdown
----
-type: x-bookmark
-author: "@username"
-name: "用户显示名"
-date: 2026-03-13
-url: https://twitter.com/user/status/123
-likes: 100
-retweets: 20
-media_count: 2
----
-
-# 用户显示名 (@username)
-*✅ 已展开完整内容*
-
-> 完整的推文内容...
-
-## 🎬 视频
-
-![[videos/username_video_123.mp4]]
-
----
-📅 保存时间: 3/13/2026, 5:00:00 PM
-📱 来源: X 书签
+```bash
+node twitter-bookmarks.mjs --count 20 --dry-run --no-image-download --no-video-download
 ```
 
-## 🛠️ 技术细节
+同步结果不仅打印到终端；写入 Obsidian 时还会保存到：
 
-### 依赖
+- `_sync/last-run.json`
+- `_sync/failures.jsonl`
 
-- **Chrome** - 需要已登录 X 的会话
-- **Puppeteer** - 连接 DevTools (localhost:9222)
-- **yt-dlp** - `brew install yt-dlp`
-- **Obsidian 插件** - Media Extended 或 Video Snippet
+退出码：`0` 完成、`2` 不完整、`3` 需要登录、`4` 被限流、`1` 致命失败。
 
-### 视频处理
+## 修复历史资产
 
-Twitter 视频使用 DASH 分片（.m4s 文件），直接下载只有几百字节。
+先 dry-run：
 
-**解决**: 使用 yt-dlp 下载完整视频
-
-```javascript
-// 检测到 Twitter 视频时
-spawn('yt-dlp', ['--output', filepath, twitterUrl]);
+```bash
+node repair-bookmarks.mjs --vault "$HOME/Documents/Obsidian Vault/Inbox/X Bookmarks" --dry-run --report /tmp/x-bookmark-repair.json
 ```
 
-### 增量保存
+确认报告后应用：
 
-```javascript
-if (existsSync(filepath)) {
-    console.log('⏭️ 跳过（已存在）');
-} else {
-    writeFileSync(filepath, content);
-}
+```bash
+node repair-bookmarks.mjs \
+  --vault "$HOME/Documents/Obsidian Vault/Inbox/X Bookmarks" \
+  --apply \
+  --backup-dir "$HOME/Documents/Obsidian Backups/X Bookmarks-$(date +%Y%m%d-%H%M%S)" \
+  --quarantine
 ```
 
-## 📍 保存位置
+应用前会完整备份；孤儿媒体只移动到 `_quarantine`，不删除。
 
-- **笔记**: `~/Documents/Obsidian Vault/Inbox/X Bookmarks/`
-- **视频**: `~/Documents/Obsidian Vault/Inbox/X Bookmarks/videos/`
+历史笔记正文为空或引用原帖缺失时，可先预演，再用候选笔记级备份刷新：
 
-## ⚠️ 注意事项
+```bash
+node refresh-bookmark-content.mjs --vault "$HOME/Documents/Obsidian Vault/Inbox/X Bookmarks" --dry-run
+node refresh-bookmark-content.mjs \
+  --vault "$HOME/Documents/Obsidian Vault/Inbox/X Bookmarks" \
+  --apply \
+  --backup-dir "$HOME/Documents/Obsidian Backups/X Content Refresh-$(date +%Y%m%d-%H%M%S)"
+```
 
-1. 首次使用需要先在 Chrome 中登录 X
-2. 视频需要 Obsidian 插件才能播放
-3. 视频文件名使用 videoId，确保同一视频不重复下载
-4. 笔记中链接的换行符已清理，避免 Markdown 链接失效
+刷新只合并主正文、引用和缺少的链接，保留分类元数据、已有本地媒体与原保存记录。删帖、私密帖或不可访问帖保留现有本地内容并写入失败报告。
 
-## 📚 相关文档
+## 整理索引
 
-- `SKILL.md` - 完整 Skill 描述和故障排除
-- `workflow.md` - 详细实现工作流
+```bash
+node organize-bookmarks.mjs --bookmark-dir "$HOME/Documents/Obsidian Vault/Inbox/X Bookmarks"
+```
+
+## 验证
+
+```bash
+npm test
+node --check twitter-bookmarks.mjs
+node --check repair-bookmarks.mjs
+node --check refresh-bookmark-content.mjs
+```
+
+详细操作和失败语义见 [SKILL.md](SKILL.md)。
