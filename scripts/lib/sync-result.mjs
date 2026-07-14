@@ -49,12 +49,14 @@ export class SyncResult {
     else if (reason === 'rate_limited') this.state = 'rate_limited';
     else if (reason === 'failed' || reason === 'fatal_error') this.state = 'failed';
     else if (this.mode === 'all') {
-      this.state = reason === 'end_of_list' && this.extracted === this.discovered && this.failed === 0
+      this.state = reason === 'end_of_list'
+        && this.extracted + this.skipped === this.discovered
+        && this.failed === 0
         ? 'complete'
         : 'incomplete';
     } else {
       this.state = this.discovered >= this.requested
-        && this.extracted >= this.requested
+        && this.extracted + this.skipped >= this.requested
         && this.failed === 0
         ? 'complete'
         : 'incomplete';

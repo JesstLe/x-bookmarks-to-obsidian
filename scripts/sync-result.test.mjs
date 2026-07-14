@@ -30,6 +30,15 @@ test('fixed-count run is complete only after extracting the requested count with
   assert.equal(result.exitCode, 0);
 });
 
+test('existing notes count as successfully handled without re-extraction', () => {
+  const result = new SyncResult({ requested: 20, mode: 'count' });
+  result.discovered = 20;
+  result.extracted = 5;
+  result.skipped = 15;
+  result.finish({ reason: 'requested_count' });
+  assert.equal(result.state, 'complete');
+});
+
 test('all mode is complete only with explicit end-of-list evidence', () => {
   const complete = new SyncResult({ requested: null, mode: 'all' });
   complete.discovered = 346;

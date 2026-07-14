@@ -1,5 +1,8 @@
 {
     "type": "module",
+    "scripts": {
+        "test": "node --test *.test.mjs"
+    },
     "dependencies": {
         "puppeteer-core": "^24.37.5"
     }
