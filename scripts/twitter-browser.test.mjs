@@ -5,6 +5,8 @@ import {
   detectPageState,
   discoverBookmarkUrls,
   extractTweetDetail,
+  resolveQuoteUrlFromCard,
+  selectBookmarkStatusUrls,
   selectTweetById,
 } from './lib/twitter-browser.mjs';
 
@@ -16,6 +18,14 @@ test('recognizes auth, rate-limit, X error, and end-of-list states', () => {
   assert.equal(detectPageState({ url: 'https://x.com/i/bookmarks', bodyText: 'Bookmarks' }), 'ready');
 });
 
+test('does not treat text inside a bookmarked post as a platform rate-limit state', () => {
+  assert.equal(detectPageState({
+    url: 'https://x.com/i/bookmarks',
+    bodyText: 'A bookmarked post discussing rate limit handling',
+    stateText: 'Bookmarks',
+  }), 'ready');
+});
+
 test('selects the article containing the requested status ID', () => {
   const selected = selectTweetById([
     { statusUrls: ['https://x.com/reply/status/2000000000000000002'] },
@@ -23,6 +33,18 @@ test('selects the article containing the requested status ID', () => {
   ], '2000000000000000001');
   assert.equal(selected.statusUrls[0], 'https://x.com/main/status/2000000000000000001');
   assert.equal(selectTweetById([], '2000000000000000001'), null);
+});
+
+test('discovers only each bookmark card time URL, not quoted status links', () => {
+  assert.deepEqual(selectBookmarkStatusUrls([
+    {
+      timeUrl: 'https://x.com/main/status/2000000000000000001',
+      statusUrls: [
+        'https://x.com/main/status/2000000000000000001',
+        'https://x.com/quote/status/2000000000000000002',
+      ],
+    },
+  ]), ['https://x.com/main/status/2000000000000000001']);
 });
 
 function fakeDiscoveryPage(snapshots) {
@@ -53,6 +75,24 @@ test('does not report completion after repeated no-progress snapshots', async ()
   });
   assert.equal(result.urls.length, 5);
   assert.equal(result.reason, 'no_progress');
+});
+
+test('waits for observable virtual-list progress between discovery rounds', async () => {
+  const five = Array.from({ length: 5 }, (_, index) => `https://x.com/user/status/200000000000000000${index}`);
+  const page = fakeDiscoveryPage([
+    { url: 'https://x.com/i/bookmarks', bodyText: 'Bookmarks', statusUrls: five, scrollHeight: 1000, lastTimeUrl: five.at(-1) },
+    { url: 'https://x.com/i/bookmarks', bodyText: 'Bookmarks', statusUrls: five, scrollHeight: 1000, lastTimeUrl: five.at(-1) },
+    { url: 'https://x.com/i/bookmarks', bodyText: 'Bookmarks', statusUrls: five, scrollHeight: 1000, lastTimeUrl: five.at(-1) },
+  ]);
+  let conditionWaits = 0;
+  page.waitForFunction = async () => { conditionWaits += 1; };
+  await discoverBookmarkUrls(page, {
+    count: 20,
+    mode: 'count',
+    maxNoProgressRounds: 2,
+    wait: async () => {},
+  });
+  assert.ok(conditionWaits >= 2);
 });
 
 test('stops with requested-count evidence after collecting enough unique URLs', async () => {
@@ -107,4 +147,21 @@ test('normalizes detail extraction and quote identity from the requested post', 
   assert.equal(detail.handle, 'main');
   assert.equal(detail.quotedTweet.url, 'https://x.com/quote/status/2000000000000000002');
   assert.deepEqual(calls[0], ['goto', 'https://x.com/main/status/2000000000000000001']);
+});
+
+test('resolves a quote card implemented as a role=link div by its navigation target', async () => {
+  let currentUrl = 'https://x.com/main/status/2000000000000000001';
+  const page = {
+    url() { return currentUrl; },
+    async evaluate(_fn, tweetId) {
+      assert.equal(tweetId, '2000000000000000001');
+      currentUrl = 'https://twitter.com/quote/status/2000000000000000002?s=20';
+      return true;
+    },
+    async waitForFunction() {},
+  };
+  assert.equal(
+    await resolveQuoteUrlFromCard(page, '2000000000000000001'),
+    'https://x.com/quote/status/2000000000000000002',
+  );
 });

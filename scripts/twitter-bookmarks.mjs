@@ -60,8 +60,8 @@ export function parseArgs(argv = process.argv.slice(2), env = process.env) {
     downloadImages: true,
     videoTimeout: 600000,
     videoSizeThreshold: 500 * 1024 * 1024,
-    maxNoProgressRounds: 5,
-    scrollDelay: 1200,
+    maxNoProgressRounds: 12,
+    scrollDelay: 1500,
     dryRun: false,
     updateExisting: false,
     help: false,
@@ -177,7 +177,7 @@ export function helpText() {
   --update-existing             刷新已有笔记
   --no-image-download           仅保留图片来源链接
   --no-video-download           仅保留视频原帖链接
-  --max-no-progress-rounds <n>  无进展重试轮数（默认 5）
+  --max-no-progress-rounds <n>  无进展重试轮数（默认 12）
   --port, -p <n>                Chrome 调试端口
   --output, -o <file>           保存 JSON 结果
   --help, -h                    显示帮助
@@ -395,6 +395,7 @@ export async function runSync(config, dependencies = {}) {
 
   try {
     resources = await deps.openBrowserPages(config);
+    await resources.listPage?.bringToFront?.();
     const discovery = await deps.discoverBookmarkUrls(resources.listPage, {
       count: config.count,
       mode: config.mode,
@@ -408,6 +409,8 @@ export async function runSync(config, dependencies = {}) {
       persistResult(config, deps, result);
       return result;
     }
+
+    await resources.detailPage?.bringToFront?.();
 
     for (const url of discovery.urls) {
       const identity = parseTweetIdentity(url);

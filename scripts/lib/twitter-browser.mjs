@@ -5,11 +5,12 @@ const RATE_PATTERNS = [/rate limit/i, /too many requests/i, /请求过于频繁/
 const ERROR_PATTERNS = [/something went wrong/i, /try reloading/i, /出错了/i, /重试/i];
 const END_PATTERNS = [/you(?:'|’)ve reached the end/i, /end of (?:your )?bookmarks/i, /已经到底/i, /没有更多/i];
 
-export function detectPageState({ url = '', bodyText = '' } = {}) {
+export function detectPageState({ url = '', bodyText = '', stateText } = {}) {
+  const platformText = stateText ?? bodyText;
   if (AUTH_PATTERNS.some((pattern) => pattern.test(url))) return 'auth_required';
-  if (RATE_PATTERNS.some((pattern) => pattern.test(bodyText))) return 'rate_limited';
-  if (END_PATTERNS.some((pattern) => pattern.test(bodyText))) return 'end_of_list';
-  if (ERROR_PATTERNS.some((pattern) => pattern.test(bodyText))) return 'failed';
+  if (RATE_PATTERNS.some((pattern) => pattern.test(platformText))) return 'rate_limited';
+  if (END_PATTERNS.some((pattern) => pattern.test(platformText))) return 'end_of_list';
+  if (ERROR_PATTERNS.some((pattern) => pattern.test(platformText))) return 'failed';
   return 'ready';
 }
 
@@ -24,6 +25,10 @@ export function selectTweetById(articles, tweetId) {
   })) || null;
 }
 
+export function selectBookmarkStatusUrls(articles) {
+  return (articles || []).map((article) => article.timeUrl).filter(Boolean);
+}
+
 function terminalReasonForState(state) {
   if (state === 'auth_required') return 'auth_required';
   if (state === 'rate_limited') return 'rate_limited';
@@ -35,8 +40,8 @@ function terminalReasonForState(state) {
 export async function discoverBookmarkUrls(page, {
   count = null,
   mode = 'count',
-  maxNoProgressRounds = 5,
-  scrollDelayMs = 1200,
+  maxNoProgressRounds = 12,
+  scrollDelayMs = 1500,
   wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
 } = {}) {
   if (!['count', 'all'].includes(mode)) throw new Error(`Invalid discovery mode: ${mode}`);
@@ -53,21 +58,31 @@ export async function discoverBookmarkUrls(page, {
   while (true) {
     const snapshot = await page.evaluate(() => {
       const articles = [...document.querySelectorAll('article[data-testid="tweet"]')];
-      const statusUrls = articles.flatMap((article) => [...article.querySelectorAll('a[href*="/status/"]')]
-        .map((anchor) => anchor.href)
-        .filter(Boolean));
+      const articleLinks = articles.map((article) => ({
+        timeUrl: article.querySelector('time')?.closest('a[href*="/status/"]')?.href || null,
+      }));
       const last = articles.at(-1);
       if (last) last.scrollIntoView({ block: 'end', behavior: 'instant' });
       window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'instant' });
       return {
         url: window.location.href,
         bodyText: document.body?.innerText || '',
-        statusUrls,
+        stateText: [...document.querySelectorAll('main *')]
+          .filter((node) => !node.closest('article[data-testid="tweet"]') && node.children.length === 0)
+          .map((node) => node.textContent?.trim() || '')
+          .filter(Boolean)
+          .join('\n'),
+        articles: articleLinks,
+        scrollHeight: document.documentElement.scrollHeight,
+        lastTimeUrl: articleLinks.at(-1)?.timeUrl || null,
       };
     });
 
     const before = discovered.size;
-    for (const rawUrl of snapshot.statusUrls || []) {
+    const candidateUrls = snapshot.articles
+      ? selectBookmarkStatusUrls(snapshot.articles)
+      : (snapshot.statusUrls || []);
+    for (const rawUrl of candidateUrls) {
       try {
         const identity = parseTweetIdentity(rawUrl);
         discovered.set(identity.id, identity.url);
@@ -89,7 +104,62 @@ export async function discoverBookmarkUrls(page, {
     if (noProgressRounds >= maxNoProgressRounds) {
       return { urls: [...discovered.values()], reason: 'no_progress' };
     }
-    await wait(scrollDelayMs);
+
+    if (typeof page.waitForFunction === 'function') {
+      try {
+        await page.waitForFunction(({ previousHeight, previousLastUrl }) => {
+          const articles = [...document.querySelectorAll('article[data-testid="tweet"]')];
+          const lastTimeUrl = articles.at(-1)
+            ?.querySelector('time')
+            ?.closest('a[href*="/status/"]')
+            ?.href || null;
+          return document.documentElement.scrollHeight !== previousHeight
+            || lastTimeUrl !== previousLastUrl;
+        }, {
+          polling: 250,
+          timeout: Math.max(3000, scrollDelayMs * 2),
+        }, {
+          previousHeight: snapshot.scrollHeight,
+          previousLastUrl: snapshot.lastTimeUrl,
+        });
+        await wait(Math.min(100, scrollDelayMs));
+      } catch {
+        // A timeout is a no-progress observation, not a fatal browser error.
+      }
+    } else {
+      await wait(scrollDelayMs);
+    }
+  }
+}
+
+export async function resolveQuoteUrlFromCard(page, tweetId, { timeoutMs = 5000 } = {}) {
+  if (typeof page?.url !== 'function') return null;
+  const before = page.url();
+  const clicked = await page.evaluate((requestedId) => {
+    const article = [...document.querySelectorAll('article[data-testid="tweet"]')]
+      .find((candidate) => [...candidate.querySelectorAll('a[href*="/status/"]')]
+        .some((anchor) => new RegExp(`/status/${requestedId}(?:/|$|\\?)`).test(anchor.href)));
+    const quoteText = article?.querySelectorAll('[data-testid="tweetText"]')?.[1];
+    const quoteCard = quoteText?.closest('[role="link"]');
+    if (!quoteCard || quoteCard.tagName === 'A') return false;
+    quoteCard.click();
+    return true;
+  }, String(tweetId));
+  if (!clicked) return null;
+  try {
+    await page.waitForFunction(
+      (previousUrl) => window.location.href !== previousUrl,
+      { timeout: timeoutMs },
+      before,
+    );
+  } catch {
+    return null;
+  }
+  try {
+    const identity = parseTweetIdentity(page.url());
+    return identity.id === String(tweetId) ? null : identity.url;
+  } catch {
+    return null;
   }
 }
 
@@ -106,7 +176,7 @@ export async function extractTweetDetail(page, identity, {
   await page.evaluate((tweetId) => {
     const articles = [...document.querySelectorAll('article[data-testid="tweet"]')];
     const matching = articles.find((article) => [...article.querySelectorAll('a[href*="/status/"]')]
-      .some((anchor) => new RegExp(`/status/${tweetId}(?:/|$|\\?)`).test(anchor.href))) || articles[0];
+      .some((anchor) => new RegExp(`/status/${tweetId}(?:/|$|\\?)`).test(anchor.href)));
     const button = matching?.querySelector('[data-testid="tweet-text-show-more-link"]')
       || [...(matching?.querySelectorAll('[role="button"]') || [])]
         .find((node) => /^(show more|显示更多)$/i.test(node.innerText?.trim() || ''));
@@ -118,7 +188,7 @@ export async function extractTweetDetail(page, identity, {
   const raw = await page.evaluate((tweetId) => {
     const articles = [...document.querySelectorAll('article[data-testid="tweet"]')];
     const article = articles.find((candidate) => [...candidate.querySelectorAll('a[href*="/status/"]')]
-      .some((anchor) => new RegExp(`/status/${tweetId}(?:/|$|\\?)`).test(anchor.href))) || articles[0];
+      .some((anchor) => new RegExp(`/status/${tweetId}(?:/|$|\\?)`).test(anchor.href)));
     if (!article) return null;
 
     const textElements = [...article.querySelectorAll('[data-testid="tweetText"]')];
@@ -210,6 +280,10 @@ export async function extractTweetDetail(page, identity, {
 
   if (!raw) throw new Error(`Tweet detail unavailable: ${canonical.url}`);
   let quote = raw.quotedTweet;
+  if (quote && !quote.url) {
+    const resolvedUrl = await resolveQuoteUrlFromCard(page, canonical.id);
+    if (resolvedUrl) quote = { ...quote, url: resolvedUrl };
+  }
   if (quote?.url) {
     try {
       const quoteIdentity = parseTweetIdentity(quote.url);

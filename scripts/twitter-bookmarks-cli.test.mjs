@@ -26,16 +26,33 @@ test('parses dry-run and media controls without touching process argv', () => {
   assert.equal(config.obsidianPath, '/tmp/home/Documents/Obsidian Vault/Inbox/X Bookmarks');
 });
 
+test('uses a patient default window for X virtual-list stalls', () => {
+  const config = parseArgs([], { HOME: '/tmp/home' });
+  assert.equal(config.maxNoProgressRounds, 12);
+  assert.equal(config.scrollDelay, 1500);
+});
+
 function fakeRuntime({ discoveredCount, reason, extractionFailures = new Set() }) {
   const urls = Array.from(
     { length: discoveredCount },
     (_, index) => `https://x.com/user/status/20000000000000000${String(index).padStart(2, '0')}`,
   );
   const browser = { disconnected: false, async disconnect() { this.disconnected = true; } };
-  const listPage = { async goto() {}, async close() {} };
-  const detailPage = { async close() {} };
+  const listPage = {
+    frontCalls: 0,
+    async goto() {},
+    async bringToFront() { this.frontCalls += 1; },
+    async close() {},
+  };
+  const detailPage = {
+    frontCalls: 0,
+    async bringToFront() { this.frontCalls += 1; },
+    async close() {},
+  };
   return {
     browser,
+    listPage,
+    detailPage,
     dependencies: {
       async openBrowserPages() { return { browser, listPage, detailPage }; },
       async discoverBookmarkUrls() { return { urls, reason }; },
@@ -87,6 +104,16 @@ test('returns complete only after handling the requested count', async () => {
   assert.equal(result.state, 'complete');
   assert.equal(result.exitCode, 0);
   assert.equal(result.extracted, 20);
+});
+
+test('keeps the virtual bookmark list in the foreground until discovery finishes', async () => {
+  const runtime = fakeRuntime({ discoveredCount: 2, reason: 'requested_count' });
+  await runSync({
+    ...parseArgs(['--count', '2', '--dry-run'], { HOME: '/tmp/home' }),
+    port: 9223,
+  }, runtime.dependencies);
+  assert.equal(runtime.listPage.frontCalls, 1);
+  assert.equal(runtime.detailPage.frontCalls, 1);
 });
 
 test('records detail failures and returns incomplete', async () => {
