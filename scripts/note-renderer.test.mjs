@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  mergeRefreshedNoteContent,
   parseFrontmatter,
   renderBookmarkNote,
   repairGeneratedNoteFields,
@@ -90,6 +91,10 @@ asset_topics:
 
 > Existing body
 
+📥 **下载地址**: https://x.com/bestiseth/status/2007345262172528850...
+
+[查看原帖](https://x.com/bestiseth/status/2007345262172528850/quotes)
+
 ---
 📅 保存时间: old
 📱 来源: X 书签
@@ -104,6 +109,9 @@ asset_topics:
   assert.match(repaired, /asset_topics:\n  - "css"/);
   assert.match(repaired, /> Existing body/);
   assert.doesNotMatch(repaired, /1773408167960/);
+  assert.doesNotMatch(repaired, /下载地址|\.\.\.|\/quotes/);
+  assert.match(repaired, /\[视频原帖\]\(https:\/\/x\.com\/bestiseth\/status\/2007345262172528850\)/);
+  assert.match(repaired, /\[查看主帖\]\(https:\/\/x\.com\/bestiseth\/status\/2007345262172528850\)/);
   assert.match(
     repaired,
     /🔖 原链接: \[https:\/\/x\.com\/bestiseth\/status\/2007345262172528850\]/,
@@ -113,4 +121,42 @@ asset_topics:
     id: '2007345262172528850',
     url: 'https://x.com/bestiseth/status/2007345262172528850',
   }), repaired);
+});
+
+test('refreshes main text and quote while preserving local assets and organizer metadata', () => {
+  const existing = `---
+type: x-bookmark
+author: "@main"
+name: "Main"
+date: "2026-07-14"
+url: "https://x.com/main/status/2000000000000000001"
+asset_category: "前端与设计"
+asset_topics:
+  - "css"
+---
+
+# Main (@main)
+
+>
+
+## 🎬 视频
+
+![[videos/already-safe.mp4]]
+
+## 💬 引用
+
+> Old incomplete quote
+
+---
+📅 保存时间: old
+📱 来源: X 书签
+🔖 原链接: [https://x.com/main/status/2000000000000000001](https://x.com/main/status/2000000000000000001)
+`;
+  const refreshed = mergeRefreshedNoteContent(existing, fixtureBookmark);
+  assert.match(refreshed, /> First paragraph\n> \n> Second line/);
+  assert.match(refreshed, /\[查看引用原帖\]\(https:\/\/x\.com\/quote\/status\/2000000000000000002\)/);
+  assert.match(refreshed, /!\[\[videos\/already-safe\.mp4\]\]/);
+  assert.match(refreshed, /asset_category: "前端与设计"/);
+  assert.match(refreshed, /📅 保存时间: old/);
+  assert.doesNotMatch(refreshed, /Old incomplete quote/);
 });

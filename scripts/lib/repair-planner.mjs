@@ -26,6 +26,67 @@ function remoteMediaUrls(markdown) {
     .map((match) => match[1]);
 }
 
+function reconnectLocalVideoEmbeds(markdown, note, videoFiles) {
+  if (/!\[\[videos\//.test(String(markdown))) {
+    return { content: String(markdown), recovered: [] };
+  }
+  const recovered = [];
+  const handlePrefix = `${note.identity.handle.toLowerCase()}_`;
+  const pattern = /!\[视频缩略图\]\((https?:\/\/[^)\n]+\/(?:amplify_video_thumb|ext_tw_video_thumb)\/(\d+)\/[^)\n]+)\)/g;
+  const content = String(markdown).replace(pattern, (thumbnail, _url, videoId) => {
+    const candidates = videoFiles
+      .filter((media) => media.filename.includes(videoId))
+      .sort((left, right) => {
+        const leftPreferred = left.filename.toLowerCase().startsWith(handlePrefix) ? 0 : 1;
+        const rightPreferred = right.filename.toLowerCase().startsWith(handlePrefix) ? 0 : 1;
+        return leftPreferred - rightPreferred || left.filename.length - right.filename.length;
+      });
+    const directDownloads = videoFiles
+      .filter((media) => media.filename.startsWith(`${note.identity.id}-`))
+      .sort((left, right) => left.filename.localeCompare(right.filename));
+    const legacyFilename = `${note.identity.handle}_pu.mp4`.toLowerCase();
+    const legacy = videoFiles.find((media) => media.filename.toLowerCase() === legacyFilename);
+    const selected = [...new Map(
+      [...candidates.slice(0, 1), ...directDownloads, ...(legacy ? [legacy] : [])]
+        .map((media) => [media.relativePath, media]),
+    ).values()].filter((media) => !String(markdown).includes(`![[${media.relativePath}]]`));
+    if (selected.length === 0) return thumbnail;
+    for (const media of selected) {
+      recovered.push({ note: note.filename, videoId, embed: media.relativePath });
+    }
+    return `${thumbnail}\n\n${selected.map((media) => `![[${media.relativePath}]]`).join('\n\n')}`;
+  });
+  return { content, recovered };
+}
+
+function quoteSectionHasNoOriginalStatus(markdown, identity) {
+  const content = String(markdown);
+  const heading = /^## 💬 引用\s*$/m.exec(content);
+  if (!heading) return false;
+  const remainder = content.slice(heading.index + heading[0].length);
+  const nextSection = /^(?:## |---\s*$)/m.exec(remainder);
+  const section = nextSection ? remainder.slice(0, nextSection.index) : remainder;
+  const statusIds = [...section.matchAll(/https?:\/\/(?:x|twitter)\.com\/[A-Za-z0-9_]+\/status\/(\d+)/g)]
+    .map((match) => match[1]);
+  return !statusIds.some((id) => id !== identity.id);
+}
+
+function mainPostTextIsEmpty(markdown) {
+  const body = String(markdown).replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '');
+  const title = /^#\s+.*$/m.exec(body);
+  if (!title) return false;
+  const remainder = body.slice(title.index + title[0].length);
+  const boundary = /^(?:## |---\r?\n📅)/m.exec(remainder);
+  const main = boundary ? remainder.slice(0, boundary.index) : remainder;
+  const quotedText = main.split(/\r?\n/)
+    .filter((line) => /^>/.test(line))
+    .map((line) => line.replace(/^>\s?/, '').trim())
+    .filter((line) => line && !/^\*.*(?:无文本内容|media or card).*\*$/i.test(line))
+    .join('')
+    .replace(/[^\p{L}\p{N}]+/gu, '');
+  return quotedText.length === 0;
+}
+
 export function inventoryVault(vaultRoot) {
   const root = path.resolve(vaultRoot);
   if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) {
@@ -71,9 +132,19 @@ export function planRepairs(inventory) {
   const missingEmbeds = [];
   const remoteMedia = [];
   const videoNotesWithoutLocalEmbed = [];
+  const recoveredVideoEmbeds = [];
+  const quoteSectionsWithoutStatusLink = [];
+  const contentRefreshCandidates = [];
 
   for (const note of inventory.notes) {
-    const repaired = repairGeneratedNoteFields(note.content, note.identity);
+    const generatedFieldsRepaired = repairGeneratedNoteFields(note.content, note.identity);
+    const videoRepair = reconnectLocalVideoEmbeds(
+      generatedFieldsRepaired,
+      note,
+      inventory.videoFiles,
+    );
+    const repaired = videoRepair.content;
+    recoveredVideoEmbeds.push(...videoRepair.recovered);
     if (repaired !== note.content) {
       noteChanges.push({
         filepath: note.filepath,
@@ -83,15 +154,32 @@ export function planRepairs(inventory) {
         identity: note.identity,
       });
     }
-    for (const embed of note.embeds) {
+    for (const embed of embeddedPaths(repaired)) {
       referenced.add(embed);
       const target = path.join(inventory.root, ...embed.split('/'));
       if (!fs.existsSync(target)) {
         missingEmbeds.push({ note: note.filename, embed, filename: path.basename(embed), target });
       }
     }
-    for (const url of note.remoteMedia) remoteMedia.push({ note: note.filename, url });
-    if (note.videoSectionWithoutLocalEmbed) videoNotesWithoutLocalEmbed.push(note.filename);
+    for (const url of remoteMediaUrls(repaired)) remoteMedia.push({ note: note.filename, url });
+    if (/^## 🎬 视频/m.test(repaired) && !/!\[\[videos\//.test(repaired)) {
+      videoNotesWithoutLocalEmbed.push(note.filename);
+    }
+    const quoteOriginalMissing = quoteSectionHasNoOriginalStatus(repaired, note.identity);
+    if (quoteOriginalMissing) {
+      quoteSectionsWithoutStatusLink.push(note.filename);
+    }
+    const reasons = [];
+    if (mainPostTextIsEmpty(repaired)) reasons.push('empty_main');
+    if (quoteOriginalMissing) reasons.push('quote_original_missing');
+    if (reasons.length > 0) {
+      contentRefreshCandidates.push({
+        filename: note.filename,
+        filepath: note.filepath,
+        identity: note.identity,
+        reasons,
+      });
+    }
   }
 
   const orphanMedia = inventory.videoFiles
@@ -116,7 +204,10 @@ export function planRepairs(inventory) {
     noteChanges,
     missingEmbeds,
     remoteMedia,
+    recoveredVideoEmbeds,
     videoNotesWithoutLocalEmbed,
+    quoteSectionsWithoutStatusLink,
+    contentRefreshCandidates,
     orphanMedia,
     duplicateGroups,
   };
@@ -143,7 +234,10 @@ function reportFor(plan, extra = {}) {
     invalidNotes: plan.invalidNotes,
     missingEmbeds: plan.missingEmbeds,
     remoteMediaCount: plan.remoteMedia.length,
+    recoveredVideoEmbeds: plan.recoveredVideoEmbeds,
     videoNotesWithoutLocalEmbed: plan.videoNotesWithoutLocalEmbed,
+    quoteSectionsWithoutStatusLink: plan.quoteSectionsWithoutStatusLink,
+    contentRefreshCandidates: plan.contentRefreshCandidates.map(({ filepath, ...item }) => item),
     orphanMedia: plan.orphanMedia.map(({ filepath, ...item }) => item),
     duplicateGroups: plan.duplicateGroups,
     ...extra,

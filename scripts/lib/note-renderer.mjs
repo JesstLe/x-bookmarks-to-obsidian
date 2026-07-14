@@ -159,9 +159,69 @@ export function repairGeneratedNoteFields(markdown, identity) {
   else frontmatterLines.push(urlLine);
 
   let body = parsed.body;
+  body = body.replace(/^📥 \*\*下载地址\*\*:.*$/gm, `[视频原帖](${canonical.url})`);
+  body = body.replace(
+    /^\[查看原帖\]\(https?:\/\/(?:x|twitter)\.com\/[^/\s]+\/status\/(\d+)\/quotes[^)]*\)$/gm,
+    (line, id) => (id === canonical.id ? `[查看主帖](${canonical.url})` : line),
+  );
   const footerLine = `🔖 原链接: [${canonical.url}](${canonical.url})`;
   if (/^🔖 原链接:.*$/m.test(body)) body = body.replace(/^🔖 原链接:.*$/m, footerLine);
   else body = `${body.replace(/\s*$/, '')}\n${footerLine}\n`;
 
   return `---\n${frontmatterLines.join('\n')}\n---\n${body}`;
+}
+
+function sectionRange(body, heading) {
+  const pattern = new RegExp(`^${heading.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'm');
+  const match = pattern.exec(body);
+  if (!match) return null;
+  const remainder = body.slice(match.index + match[0].length);
+  const next = /^(?:## |---\r?\n📅)/m.exec(remainder);
+  return {
+    start: match.index,
+    end: next ? match.index + match[0].length + next.index : body.length,
+  };
+}
+
+function sectionContent(body, heading) {
+  const range = sectionRange(body, heading);
+  return range ? body.slice(range.start, range.end).trim() : null;
+}
+
+function replaceOrInsertSection(body, heading, freshSection, beforeHeading = null) {
+  if (!freshSection) return body;
+  const existing = sectionRange(body, heading);
+  if (existing) {
+    return `${body.slice(0, existing.start).replace(/\s*$/, '\n\n')}${freshSection}\n\n${body.slice(existing.end).replace(/^\s*/, '')}`;
+  }
+  const before = beforeHeading ? sectionRange(body, beforeHeading) : null;
+  const footer = /^(?:---\r?\n📅)/m.exec(body);
+  const insertion = before?.start ?? footer?.index ?? body.length;
+  return `${body.slice(0, insertion).replace(/\s*$/, '\n\n')}${freshSection}\n\n${body.slice(insertion).replace(/^\s*/, '')}`;
+}
+
+export function mergeRefreshedNoteContent(existingMarkdown, bookmark) {
+  const existing = parseFrontmatter(existingMarkdown);
+  if (!existing.raw) throw new Error('Cannot refresh note without frontmatter');
+  const fresh = parseFrontmatter(renderBookmarkNote(bookmark, { savedAt: new Date(0) }));
+
+  const existingBoundary = /^(?:## |---\r?\n📅)/m.exec(existing.body);
+  const freshBoundary = /^(?:## |---\r?\n📅)/m.exec(fresh.body);
+  const existingTail = existingBoundary ? existing.body.slice(existingBoundary.index) : '';
+  const freshMain = (freshBoundary ? fresh.body.slice(0, freshBoundary.index) : fresh.body).trim();
+  let body = `${freshMain}\n\n${existingTail.replace(/^\s*/, '')}`;
+
+  body = replaceOrInsertSection(
+    body,
+    '## 🔗 链接',
+    sectionContent(fresh.body, '## 🔗 链接'),
+    '## 💬 引用',
+  );
+  body = replaceOrInsertSection(
+    body,
+    '## 💬 引用',
+    sectionContent(fresh.body, '## 💬 引用'),
+  );
+
+  return `---\n${existing.raw}\n---\n${body.replace(/\s*$/, '\n')}`;
 }
