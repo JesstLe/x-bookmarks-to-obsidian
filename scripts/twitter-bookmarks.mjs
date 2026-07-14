@@ -17,6 +17,11 @@ import { fileURLToPath } from "url";
 import { execSync, spawn } from "child_process";
 import https from "https";
 import http from "http";
+import {
+    buildYtDlpDownloadArgs as buildMediaDownloadArgs,
+    buildYtDlpMetadataArgs,
+    parseYtDlpJsonLines,
+} from "./lib/media-manager.mjs";
 
 // ---- 解析参数 ----
 function parseArgs() {
@@ -165,13 +170,12 @@ function downloadVideo(url, filepath, tweetUrl = null, timeout = 600000) {
 
 // ---- 使用 yt-dlp 下载视频 ----
 export function buildYtDlpDownloadArgs(filepath, twitterUrl, timeout = 600000) {
-    return [
-        '--output', filepath,
-        '--format', 'worst',
-        '--no-playlist',
-        '--socket-timeout', String(Math.floor(timeout / 1000)),
-        twitterUrl
-    ];
+    return buildMediaDownloadArgs({
+        output: filepath,
+        tweetUrl: twitterUrl,
+        cookieProfile: process.env.X_BOOKMARKS_CHROME_PROFILE || path.join(process.env.HOME || '/Users/lv', '.chrome-debug-profile'),
+        timeoutMs: timeout,
+    });
 }
 
 function downloadVideoWithYtdlp(segmentUrl, filepath, inputTwitterUrl, reject, resolve, timeout = 600000) {
@@ -248,11 +252,13 @@ function extractVideoId(posterUrl) {
 // ---- 获取视频大小信息（不下载） ----
 function getVideoSize(tweetUrl, timeout = 20000) {
     return new Promise((resolve) => {
-        const ytdlp = spawn('yt-dlp', [
-            '--dump-json',
-            '--no-playlist',
-            tweetUrl
-        ], { timeout: timeout });
+        const cookieProfile = process.env.X_BOOKMARKS_CHROME_PROFILE
+            || path.join(process.env.HOME || '/Users/lv', '.chrome-debug-profile');
+        const ytdlp = spawn('yt-dlp', buildYtDlpMetadataArgs({
+            tweetUrl,
+            cookieProfile,
+            timeoutMs: timeout,
+        }));
         
         let stdout = '';
         let stderr = '';
@@ -274,12 +280,15 @@ function getVideoSize(tweetUrl, timeout = 20000) {
             clearTimeout(timeoutId);
             if (code === 0) {
                 try {
-                    const info = JSON.parse(stdout);
-                    if (info && info.filesize) {
+                    const entries = parseYtDlpJsonLines(stdout);
+                    const sizes = entries.map(info => Number(info.filesize || info.filesize_approx || 0));
+                    const size = sizes.reduce((total, value) => total + value, 0);
+                    if (entries.length > 0 && size > 0) {
                         resolve({ 
-                            size: info.filesize,
-                            duration: info.duration,
-                            format: info.format
+                            size,
+                            entries,
+                            duration: entries.reduce((total, info) => total + (Number(info.duration) || 0), 0),
+                            format: entries.map(info => info.format).filter(Boolean).join(', ')
                         });
                     } else {
                         resolve({ error: '无法获取文件大小' });
