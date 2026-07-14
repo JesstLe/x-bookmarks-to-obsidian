@@ -4,11 +4,55 @@ import assert from 'node:assert/strict';
 import {
   detectPageState,
   discoverBookmarkUrls,
+  extractExpandedQuoteDetail,
   extractTweetDetail,
+  repairBrokenWrappedText,
   resolveQuoteUrlFromCard,
   selectBookmarkStatusUrls,
   selectTweetById,
 } from './lib/twitter-browser.mjs';
+
+test('repairs URLs and hyphenated names split by X paragraph wrapping', () => {
+  assert.equal(
+    repairBrokenWrappedText('https://\n\nexample.com/docs\n\n/api\n\nboss\n\n-cli'),
+    'https://example.com/docs/api\n\nboss-cli',
+  );
+});
+
+test('opens the exact quoted post and extracts its expanded full text', async () => {
+  const calls = [];
+  let currentUrl = 'https://x.com/main/status/2000000000000000001';
+  let evaluation = 0;
+  const page = {
+    url() { return currentUrl; },
+    async goto(url) {
+      currentUrl = url;
+      calls.push(['goto', url]);
+    },
+    async waitForSelector(selector) { calls.push(['waitForSelector', selector]); },
+    async evaluate(_fn, tweetId) {
+      evaluation += 1;
+      calls.push(['evaluate', tweetId]);
+      if (evaluation === 1) return 2;
+      return {
+        author: 'Quoted Author',
+        handle: 'quote',
+        text: 'Full https://\n\nexample.com/article',
+      };
+    },
+  };
+
+  const quote = await extractExpandedQuoteDetail(
+    page,
+    'https://twitter.com/quote/status/2000000000000000002?s=20',
+    { wait: async () => {} },
+  );
+
+  assert.deepEqual(calls[0], ['goto', 'https://x.com/quote/status/2000000000000000002']);
+  assert.equal(quote.url, 'https://x.com/quote/status/2000000000000000002');
+  assert.equal(quote.handle, 'quote');
+  assert.equal(quote.text, 'Full https://example.com/article');
+});
 
 test('recognizes auth, rate-limit, X error, and end-of-list states', () => {
   assert.equal(detectPageState({ url: 'https://x.com/i/flow/login', bodyText: '' }), 'auth_required');

@@ -163,6 +163,76 @@ export async function resolveQuoteUrlFromCard(page, tweetId, { timeoutMs = 5000 
   }
 }
 
+export function repairBrokenWrappedText(text) {
+  if (!text) return '';
+  return String(text)
+    .replace(/\r\n?/g, '\n')
+    .replace(/(https?:\/\/|www\.)\n\n(?=[A-Za-z0-9])/g, '$1')
+    .replace(/((?:https?:\/\/)?[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?:\/[A-Za-z0-9._~!$&'()*+,;=:@%/-]*)?)\n\n(?=[A-Za-z0-9/_~!$&'()*+,;=:@%#?-])/g, '$1')
+    .replace(/([A-Za-z0-9._~!$&'()*+,;=:@%/-]+)\n\n-(?=[A-Za-z0-9])/g, '$1-');
+}
+
+export async function extractExpandedQuoteDetail(page, quoteUrl, {
+  navigationTimeoutMs = 30000,
+  selectorTimeoutMs = 12000,
+  expandDelayMs = 500,
+  wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+} = {}) {
+  const canonical = parseTweetIdentity(quoteUrl);
+  let currentIdentity = null;
+  try {
+    currentIdentity = typeof page?.url === 'function' ? parseTweetIdentity(page.url()) : null;
+  } catch {
+    currentIdentity = null;
+  }
+  if (currentIdentity?.id !== canonical.id) {
+    await page.goto(canonical.url, { waitUntil: 'domcontentloaded', timeout: navigationTimeoutMs });
+  }
+  await page.waitForSelector('article[data-testid="tweet"]', { timeout: selectorTimeoutMs });
+
+  const expandedCount = await page.evaluate((tweetId) => {
+    const article = [...document.querySelectorAll('article[data-testid="tweet"]')]
+      .find((candidate) => [...candidate.querySelectorAll('a[href*="/status/"]')]
+        .some((anchor) => new RegExp(`/status/${tweetId}(?:/|$|\\?)`).test(anchor.href)));
+    if (!article) return 0;
+    const clicked = new Set();
+    const clickIfShowMore = (node) => {
+      const label = (node?.innerText || node?.textContent || '').trim();
+      if (!/^(show more|显示更多)$/i.test(label) || clicked.has(node)) return;
+      node.click();
+      clicked.add(node);
+    };
+    article.querySelectorAll('[data-testid="tweet-text-show-more-link"], button, a, span')
+      .forEach(clickIfShowMore);
+    return clicked.size;
+  }, canonical.id);
+  if (expandedCount > 0) await wait(expandDelayMs);
+
+  const detail = await page.evaluate((tweetId) => {
+    const article = [...document.querySelectorAll('article[data-testid="tweet"]')]
+      .find((candidate) => [...candidate.querySelectorAll('a[href*="/status/"]')]
+        .some((anchor) => new RegExp(`/status/${tweetId}(?:/|$|\\?)`).test(anchor.href)));
+    if (!article) return null;
+    const userName = article.querySelector('[data-testid="User-Name"]');
+    const profileHref = [...(userName?.querySelectorAll('a[href]') || [])]
+      .map((anchor) => anchor.getAttribute('href'))
+      .find((href) => /^\/[A-Za-z0-9_]+$/.test(href || ''));
+    const handle = profileHref?.slice(1) || '';
+    return {
+      author: userName?.innerText?.split('\n')[0]?.trim() || handle,
+      handle,
+      text: article.querySelector('[data-testid="tweetText"]')?.innerText || '',
+    };
+  }, canonical.id);
+  if (!detail) throw new Error(`Quoted tweet detail unavailable: ${canonical.url}`);
+  return {
+    ...detail,
+    handle: canonical.handle,
+    text: repairBrokenWrappedText(detail.text),
+    url: canonical.url,
+  };
+}
+
 export async function extractTweetDetail(page, identity, {
   navigationTimeoutMs = 30000,
   selectorTimeoutMs = 12000,
@@ -292,6 +362,19 @@ export async function extractTweetDetail(page, identity, {
       quote = { ...quote, url: null };
     }
   }
+  if (quote?.url) {
+    try {
+      const expandedQuote = await extractExpandedQuoteDetail(page, quote.url, {
+        navigationTimeoutMs,
+        selectorTimeoutMs,
+        expandDelayMs,
+        wait,
+      });
+      quote = { ...quote, ...expandedQuote };
+    } catch {
+      quote = { ...quote, text: repairBrokenWrappedText(quote.text) };
+    }
+  }
   return {
     ...raw,
     identity: canonical,
@@ -299,6 +382,8 @@ export async function extractTweetDetail(page, identity, {
     tweetUrl: canonical.url,
     images: (raw.images || []).map((sourceUrl) => ({ sourceUrl })),
     videos: (raw.videos || []).map((video) => ({ ...video, sourceUrl: canonical.url })),
+    text: repairBrokenWrappedText(raw.text),
+    links: (raw.links || []).map((link) => ({ ...link, text: repairBrokenWrappedText(link.text) })),
     quotedTweet: quote,
   };
 }
